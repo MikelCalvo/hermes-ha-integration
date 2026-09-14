@@ -1,4 +1,4 @@
-"""Emoji cleanup shared by final speech and incremental voice responses."""
+"""Emoji and inline-link cleanup for voice responses."""
 
 from __future__ import annotations
 
@@ -41,6 +41,59 @@ _EMOJI_RE = re.compile(
 # explicit emoji presentation selector follows them. Digits/#/* need a keycap.
 _TEXT_SYMBOLS = frozenset("©®™↔↕↖↗↘↙↩↪◻◼◽◾⤴⤵✖➕➖➗")
 _KEYCAP_BASES = frozenset("#*0123456789")
+
+
+class SpeechMarkdownFilter:
+    """Keep split inline links/images out of speech without buffering a turn.
+
+    Retain only a possible label (up to 4096 characters); once a URL starts,
+    discard it incrementally. Ordinary text is emitted immediately.
+    """
+
+    def __init__(self) -> None:
+        self._label = ""
+        self._url_depth = 0
+
+    def feed(self, text: str) -> str:
+        """Emit visible text and link labels, never inline URL destinations."""
+        parts: list[str] = []
+        for char in text:
+            if self._url_depth:
+                if char == "(":
+                    self._url_depth += 1
+                elif char == ")":
+                    self._url_depth -= 1
+                continue
+
+            if self._label == "!" and char != "[":
+                parts.append(self._label)
+                self._label = ""
+            elif self._label.endswith("]"):
+                if char == "(":
+                    start = 2 if self._label.startswith("![") else 1
+                    parts.append(self._label[start:-1])
+                    self._label = ""
+                    self._url_depth = 1
+                    continue
+                parts.append(self._label)
+                self._label = ""
+
+            if self._label or char in "[!":
+                self._label += char
+                # A long bracketed expression need not delay an entire reply.
+                if len(self._label) >= 4096:
+                    parts.append(self._label)
+                    self._label = ""
+            else:
+                parts.append(char)
+        return "".join(parts)
+
+    def flush(self) -> str:
+        """Release a non-link label, discarding any unfinished URL."""
+        pending = self._label
+        self._label = ""
+        self._url_depth = 0
+        return pending
 
 
 class SpeechEmojiFilter:

@@ -80,6 +80,40 @@ class SpeechCleanupTests(unittest.TestCase):
                 streamed = speech_filter.feed(markup) + speech_filter.flush()
                 self.assertEqual(streamed, "")
 
+    def test_stream_removes_emoji_only_links_at_every_split(self):
+        for markup in (
+            "[🌞](https://example.com/x)",
+            "[🌞 🌞](https://example.com/x)",
+            "![1️⃣](https://example.com/x)",
+            "[](https://example.com/x)",
+        ):
+            text = f"Ready? {markup} Next."
+            chunkings = [[text[:split], text[split:]] for split in range(len(text) + 1)]
+            chunkings.append(list(text))
+            for chunks in chunkings:
+                with self.subTest(markup=markup, chunks=chunks):
+                    speech_filter = _UnsafeSpeechStreamFilter()
+                    parts = [speech_filter.feed(chunk) for chunk in chunks]
+                    parts.append(speech_filter.flush())
+                    self.assertEqual("".join(parts).split(), ["Ready?", "Next."])
+
+    def test_link_streaming_preserves_labels_and_plain_brackets(self):
+        cases = (
+            ("Read [docs](https://example.com/x) now!", "Read docs now!"),
+            ("![photo](https://example.com/x) here", "photo here"),
+            ("[docs](https://example.com/a_(b))!", "docs!"),
+            ("Values [1, 2], x[0] = 3!", "Values [1, 2], x[0] = 3!"),
+            ("[unfinished label", "[unfinished label"),
+            ("[docs](https://example.com/unfinished", "docs"),
+            ("[" + "x" * 5000, "[" + "x" * 5000),
+        )
+        for text, expected in cases:
+            with self.subTest(text=text[:80]):
+                speech_filter = _UnsafeSpeechStreamFilter()
+                parts = [speech_filter.feed(char) for char in text]
+                parts.append(speech_filter.flush())
+                self.assertEqual("".join(parts), expected)
+
     def test_stream_removes_emoji_at_every_split(self):
         for emoji in EMOJI:
             text = f"Ready? {emoji} Next."
@@ -201,6 +235,49 @@ class VoiceFollowUpTests(unittest.IsolatedAsyncioTestCase):
         deltas = agent.hass.data["last_chat_log"].deltas
         self.assertEqual("".join(d.get("content", "") for d in deltas), "Ready?")
         self.assertEqual([call["method"] for call in client.calls], ["stream", "send"])
+
+    async def test_split_emoji_links_never_reach_chat_log_or_tts(self):
+        for fail_after in (False, True):
+            with self.subTest(fail_after=fail_after):
+                client = FakeClient(
+                    stream_chunks=["Ready? ", "[", "🌞", "](https://example.com/x)"],
+                    stream_error_after_chunks=conversation_module.HermesApiError(
+                        "dropped"
+                    )
+                    if fail_after
+                    else None,
+                )
+                agent = self.make_agent(client)
+                with mock.patch.object(
+                    agent.hass.services, "async_call", new_callable=mock.AsyncMock
+                ) as speak:
+                    if fail_after:
+                        with self.assertLogs(
+                            conversation_module._LOGGER, level="WARNING"
+                        ):
+                            result = await agent.async_process(
+                                FakeConversationInput(
+                                    "hello",
+                                    conversation_id="split-link",
+                                    device_id="test",
+                                )
+                            )
+                    else:
+                        result = await agent.async_process(
+                            FakeConversationInput(
+                                "hello", conversation_id="split-link", device_id="test"
+                            )
+                        )
+                self.assertEqual(result.response.speech["plain"]["speech"], "Ready?")
+                self.assertTrue(result.continue_conversation)
+                speak.assert_awaited_once()
+                assert speak.await_args is not None
+                self.assertEqual(speak.await_args.args[2]["message"], "Ready?")
+                deltas = agent.hass.data["last_chat_log"].deltas
+                self.assertEqual(
+                    "".join(d.get("content", "") for d in deltas).strip(), "Ready?"
+                )
+                self.assertEqual([call["method"] for call in client.calls], ["stream"])
 
     async def test_partial_stream_error_preserves_pending_plain_symbol(self):
         for suffix in ("22", "©", "#"):

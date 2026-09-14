@@ -56,7 +56,7 @@ from .const import (
     FOLLOW_UP_MODE_AUTO,
     LEGACY_CONF_INSTRUCTIONS,
 )
-from .speech import SpeechEmojiFilter, strip_speech_emoji
+from .speech import SpeechEmojiFilter, SpeechMarkdownFilter, strip_speech_emoji
 
 try:
     from homeassistant.components.conversation import ChatLog, async_get_chat_log
@@ -131,6 +131,7 @@ class _UnsafeSpeechStreamFilter:
         self._buffer = ""
         self._discard_until_tag: str | None = None
         self._emoji_filter = SpeechEmojiFilter()
+        self._markdown_filter = SpeechMarkdownFilter()
 
     def feed(self, text: str) -> str:
         """Add a stream delta and return the safe text that can be emitted now."""
@@ -144,7 +145,8 @@ class _UnsafeSpeechStreamFilter:
         if partial:
             self._buffer = ""
             self._discard_until_tag = None
-            return self._emoji_filter.flush()
+            safe = self._emoji_filter.feed(self._markdown_filter.flush())
+            return safe + self._emoji_filter.flush()
         return self._drain(final=True)
 
     def _drain(self, *, final: bool) -> str:
@@ -194,7 +196,10 @@ class _UnsafeSpeechStreamFilter:
             safe_parts.append(self._consume_safe_buffer(final=final))
             break
 
-        cleaned = _sanitize_stream_text_for_speech("".join(safe_parts))
+        visible = self._markdown_filter.feed("".join(safe_parts))
+        if final:
+            visible += self._markdown_filter.flush()
+        cleaned = _sanitize_stream_text_for_speech(visible)
         safe = self._emoji_filter.feed(cleaned)
         if final:
             safe += self._emoji_filter.flush()
