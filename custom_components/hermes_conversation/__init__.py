@@ -12,9 +12,14 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from .api import HermesApiClient
 from .compat import entry_value, resolve_connection_config
 from .const import DEFAULT_TIMEOUT, DOMAIN, LEGACY_CONF_MODEL, LEGACY_CONF_TIMEOUT
+from .coordinator import HermesDiagnosticsCoordinator
 
 _LOGGER = logging.getLogger(__name__)
-PLATFORMS: tuple[Platform, ...] = (Platform.CONVERSATION,)
+PLATFORMS: tuple[Platform, ...] = (
+    Platform.CONVERSATION,
+    Platform.SENSOR,
+    Platform.BINARY_SENSOR,
+)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -37,12 +42,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.data.setdefault(DOMAIN, {})
     session_map: dict[str, dict[str, object]] = {}
+    coordinator = HermesDiagnosticsCoordinator(hass, entry, client)
 
     hass.data[DOMAIN][entry.entry_id] = {
         "client": client,
         "sessions": session_map,
+        "coordinator": coordinator,
     }
 
+    await coordinator.async_refresh()
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))

@@ -514,7 +514,13 @@ class OptionsFlowTests(unittest.IsolatedAsyncioTestCase):
             data=connection_input(),
             options={CONF_PROMPT: "old prompt"},
         )
-        hass = FakeHass(session=FakeSession(successful_probe_responses()))
+        hass = FakeHass(
+            session=FakeSession(
+                successful_probe_responses()
+                + [FakeResponse(status=404)]
+                + successful_probe_responses()
+            )
+        )
         hass.config_entries.entries = [entry]
         await integration.async_setup_entry(hass, entry)
         flow = self.make_flow(entry, hass=hass)
