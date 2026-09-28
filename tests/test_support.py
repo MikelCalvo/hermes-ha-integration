@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 import types
 from contextlib import contextmanager
@@ -20,6 +21,7 @@ class FakeConfigEntry:
         self.title = title
         self.update_listeners = []
         self._on_unload = []
+        self._background_tasks = set()
 
     def add_update_listener(self, listener):
         self.update_listeners.append(listener)
@@ -34,7 +36,18 @@ class FakeConfigEntry:
         self._on_unload.append(value)
         return value
 
+    def async_create_background_task(self, hass, target, name, eager_start=True):
+        task = hass.async_create_background_task(target, name, eager_start)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
     async def async_execute_unload(self):
+        tasks = tuple(self._background_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         while self._on_unload:
             callback = self._on_unload.pop()
             result = callback()
@@ -257,6 +270,17 @@ class FakeHass:
         self._entity_registry = SimpleNamespace(async_get=lambda entity_id: None)
         self._device_registry = SimpleNamespace(async_get=lambda device_id: None)
         self._area_registry = SimpleNamespace(async_get_area=lambda area_id: None)
+        self._background_tasks = set()
+
+    def async_create_background_task(self, target, name, eager_start=True):
+        task = asyncio.create_task(target, name=name)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
+    async def async_block_till_done(self, wait_background_tasks=False):
+        if wait_background_tasks and self._background_tasks:
+            await asyncio.gather(*tuple(self._background_tasks))
 
 
 def install_stubs():

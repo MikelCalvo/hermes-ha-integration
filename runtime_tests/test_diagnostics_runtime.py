@@ -6,9 +6,11 @@ imports. Fakes only the Hermes HTTP boundary via runtime_tests.loopback.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
+from homeassistant.components import conversation
 from homeassistant.const import (
     STATE_OFF,
     STATE_ON,
@@ -81,7 +83,7 @@ def _entry(
 async def _setup(hass: HomeAssistant, entry: MockConfigEntry) -> ConfigEntry:
     entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(entry.entry_id)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     live = hass.config_entries.async_get_entry(entry.entry_id)
     assert live is not None
     assert live.state is ConfigEntryState.LOADED
@@ -225,6 +227,72 @@ async def test_offline_setup_does_not_block_conversation(
     assert _state(hass, ids["health"]).state == STATE_UNAVAILABLE
     assert _state(hass, ids["api_latency"]).state == STATE_UNAVAILABLE
     assert _state(hass, ids["last_successful_connection"]).state == STATE_UNAVAILABLE
+
+
+async def test_blocked_diagnostics_request_does_not_delay_conversation_setup(
+    hass_ready: HomeAssistant, hermes_api: HermesLoopbackApi
+) -> None:
+    hass = hass_ready
+    release = asyncio.Event()
+    hermes_api.block_requests = release
+    entry = _entry(hermes_api, entry_id="blocked-entry")
+    entry.add_to_hass(hass)
+    try:
+        # Wait for the real TCP request to reach the server and remain unanswered.
+        setup = hass.async_create_task(
+            hass.config_entries.async_setup(entry.entry_id), "setup blocked Hermes entry"
+        )
+        try:
+            await asyncio.wait_for(hermes_api.request_started.wait(), timeout=5)
+            assert not release.is_set()
+            assert await asyncio.wait_for(setup, timeout=2)
+            live = hass.config_entries.async_get_entry(entry.entry_id)
+            assert live is not None
+            assert live.state is ConfigEntryState.LOADED
+            ids = _ids(hass, entry.entry_id)
+            assert conversation.async_get_agent(hass, ids["conversation"]) is not None
+            assert _state(hass, ids["api_connectivity"]).state == STATE_OFF
+            assert _state(hass, ids["health"]).state == STATE_UNAVAILABLE
+        finally:
+            release.set()
+        await hass.async_block_till_done(wait_background_tasks=True)
+        assert _state(hass, ids["api_connectivity"]).state == STATE_ON
+        assert _state(hass, ids["health"]).state == "ok"
+    finally:
+        release.set()
+
+
+async def test_unload_cancels_blocked_initial_refresh(
+    hass_ready: HomeAssistant, hermes_api: HermesLoopbackApi
+) -> None:
+    hass = hass_ready
+    release = asyncio.Event()
+    hermes_api.block_requests = release
+    entry = _entry(hermes_api, entry_id="unload-blocked-entry")
+    entry.add_to_hass(hass)
+    try:
+        assert await asyncio.wait_for(hass.config_entries.async_setup(entry.entry_id), 2)
+        await asyncio.wait_for(hermes_api.request_started.wait(), 5)
+        assert not release.is_set()
+        # The request was already recorded by the server; verify the actual
+        # background task is cancelled, not just that no new requests appear.
+        refresh_tasks = [
+            task
+            for task in entry._background_tasks
+            if task.get_name().startswith("Hermes diagnostics initial refresh")
+        ]
+        assert len(refresh_tasks) == 1
+        refresh_task = refresh_tasks[0]
+        assert not refresh_task.done()
+        assert await asyncio.wait_for(hass.config_entries.async_unload(entry.entry_id), 2)
+        assert entry.state is ConfigEntryState.NOT_LOADED
+        assert refresh_task.cancelled()
+        before = len(hermes_api.requests)
+        release.set()
+        await hass.async_block_till_done(wait_background_tasks=True)
+        assert len(hermes_api.requests) == before
+    finally:
+        release.set()
 
 
 async def test_loss_recovery_retains_utc_timestamp(
@@ -408,7 +476,7 @@ async def test_unload_and_reload_stop_stale_polling(
     assert connectivity is None or connectivity.state == STATE_UNAVAILABLE
 
     assert await hass.config_entries.async_setup(entry.entry_id)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     reloaded = _ids(hass, entry.entry_id)
     assert _state(hass, reloaded["api_connectivity"]).state == STATE_ON
     before = hermes_api.count_paths("/v1/models", "/health/detailed")

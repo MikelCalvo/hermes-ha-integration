@@ -6,6 +6,7 @@ Home Assistant stubs. Bind is 127.0.0.1 only.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -108,6 +109,8 @@ class HermesLoopbackApi:
     addon: dict[str, RouteBundle] = field(default_factory=dict)
     native: dict[str, RouteBundle] = field(default_factory=dict)
     native_canary_status: int = 404
+    block_requests: asyncio.Event | None = None
+    request_started: asyncio.Event = field(default_factory=asyncio.Event)
     _runner: web.AppRunner | None = field(default=None, init=False, repr=False)
     _site: web.TCPSite | None = field(default=None, init=False, repr=False)
 
@@ -198,6 +201,10 @@ class HermesLoopbackApi:
                 fixture_label=label,
             )
         )
+
+        self.request_started.set()
+        if self.block_requests is not None:
+            await self.block_requests.wait()
 
         if fixture is None:
             return web.json_response({"detail": "Not Found"}, status=404)

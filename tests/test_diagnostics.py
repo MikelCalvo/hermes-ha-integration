@@ -836,12 +836,12 @@ class DiagnosticsContractTests(unittest.TestCase):
         self.assertEqual(strings["entity"], expected["entity"])
         self.assertEqual(english["entity"], expected["entity"])
 
-    def test_manifest_uses_polling_iot_class_without_version_bump(self):
+    def test_manifest_uses_polling_iot_class_and_next_feature_version(self):
         manifest = json.loads(
             (REPO_ROOT / "custom_components/hermes_conversation/manifest.json").read_text()
         )
         self.assertEqual(manifest["iot_class"], "local_polling")
-        self.assertEqual(manifest["version"], "1.2.0")
+        self.assertEqual(manifest["version"], "1.3.0")
 
     def test_hacs_metadata_matches_diagnostic_platforms(self):
         hacs = json.loads((REPO_ROOT / "hacs.json").read_text())

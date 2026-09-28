@@ -50,10 +50,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "coordinator": coordinator,
     }
 
-    await coordinator.async_refresh()
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+    # A slow or black-holed diagnostics endpoint must not delay the conversation agent.
+    entry.async_create_background_task(
+        hass,
+        coordinator.async_refresh(),
+        f"Hermes diagnostics initial refresh ({entry.entry_id})",
+        eager_start=False,
+    )
 
     _LOGGER.info("Hermes Conversation set up successfully")
     return True
