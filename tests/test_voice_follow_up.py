@@ -30,7 +30,6 @@ from custom_components.hermes_conversation.conversation import (
 EMOJI = (
     "🌞",
     "☀️",
-    "☀︎",
     "👍🏽",
     "👩🏽‍💻",
     "👨‍👩‍👧‍👦",
@@ -97,15 +96,61 @@ class SpeechCleanupTests(unittest.TestCase):
                     parts.append(speech_filter.flush())
                     self.assertEqual("".join(parts).split(), ["Ready?", "Next."])
 
+    def test_explicit_text_presentation_survives_complete_and_split_streams(self):
+        for symbol in ("➡︎", "✈︎", "ℹ︎", "☀︎"):
+            text = f"A {symbol} B"
+            with self.subTest(symbol=symbol):
+                self.assertEqual(_sanitize_text_for_speech(text), text)
+                for split in range(len(text) + 1):
+                    speech_filter = _UnsafeSpeechStreamFilter()
+                    parts = [speech_filter.feed(text[:split])]
+                    parts.append(speech_filter.feed(text[split:]))
+                    parts.append(speech_filter.flush())
+                    self.assertEqual("".join(parts), text)
+                speech_filter = _UnsafeSpeechStreamFilter()
+                self.assertEqual(
+                    "".join(speech_filter.feed(char) for char in text)
+                    + speech_filter.flush(),
+                    text,
+                )
+        self.assertEqual(_sanitize_text_for_speech("A ➡️ B"), "A B")
+
+    def test_nested_and_escaped_link_labels_never_expose_destination(self):
+        cases = (
+            ("[array[0]](https://example.com/private)", "array[0]"),
+            (r"[array\]0](https://example.com/private)", r"array\]0"),
+            ("![photo[0]](https://example.com/private)", "photo[0]"),
+            ("[nested [inner] label](https://example.com/private_(x))", "nested [inner] label"),
+            ("[![img](https://evil.com/token)](https://other.example/x)", "img"),
+            ("[a [inner](https://evil.com/token) z](https://other.example/x)", "a inner z"),
+            (r"[label\](https://evil.com/token)", "label\\"),
+            ("[a]](https://evil.com/token)", "a]"),
+            ("[[a](https://evil.com/token)](https://other.example/x)", "a"),
+        )
+        for markup, label in cases:
+            text = f"Read {markup} now."
+            expected = f"Read {label} now."
+            with self.subTest(markup=markup):
+                self.assertEqual(_sanitize_text_for_speech(text), expected)
+                chunkings = ([text[:i], text[i:]] for i in range(len(text) + 1))
+                for chunks in (*chunkings, list(text)):
+                    speech_filter = _UnsafeSpeechStreamFilter()
+                    output = "".join(speech_filter.feed(chunk) for chunk in chunks)
+                    output += speech_filter.flush()
+                    self.assertEqual(output, expected)
+                    self.assertNotIn("https://", output)
+
     def test_link_streaming_preserves_labels_and_plain_brackets(self):
         cases = (
             ("Read [docs](https://example.com/x) now!", "Read docs now!"),
             ("![photo](https://example.com/x) here", "photo here"),
             ("[docs](https://example.com/a_(b))!", "docs!"),
+            (r"[docs](https://example.com/a\)b) now", "docs now"),
             ("Values [1, 2], x[0] = 3!", "Values [1, 2], x[0] = 3!"),
             ("[unfinished label", "[unfinished label"),
             ("[docs](https://example.com/unfinished", "docs"),
-            ("[" + "x" * 5000, "[" + "x" * 5000),
+            ("[" + "x" * 5000, ""),
+            ("[" + "x" * 5000 + "](https://example.com/private) safe", " safe"),
         )
         for text, expected in cases:
             with self.subTest(text=text[:80]):
@@ -278,6 +323,55 @@ class VoiceFollowUpTests(unittest.IsolatedAsyncioTestCase):
                     "".join(d.get("content", "") for d in deltas).strip(), "Ready?"
                 )
                 self.assertEqual([call["method"] for call in client.calls], ["stream"])
+
+    async def test_nested_link_destinations_never_reach_chat_log_tts_or_history(self):
+        cases = (
+            ("[array[0]](https://example.com/private)", "array[0]"),
+            ("[![img](https://evil.com/token)](https://other.example/x)", "img"),
+            ("[a [inner](https://evil.com/token) z](https://other.example/x)", "a inner z"),
+            (r"[label\](https://evil.com/token)", "label\\"),
+            ("[a]](https://evil.com/token)", "a]"),
+            ("[[a](https://evil.com/token)](https://other.example/x)", "a"),
+        )
+        for markup, label in cases:
+            expected = f"Read {label} now?"
+            for legacy in (False, True):
+                for fallback in (False, True):
+                    for split in (range(len(markup) + 1) if not fallback else (0,)):
+                        with self.subTest(legacy=legacy, fallback=fallback, split=split):
+                            client = FakeClient(
+                                stream_chunks=["Read ", markup[:split], markup[split:], " now?"],
+                                stream_error=HermesStreamSetupError("rejected")
+                                if fallback
+                                else None,
+                                send_text=f"Read {markup} now?",
+                            )
+                            agent = self.make_agent(client)
+                            with (
+                                mock.patch.object(
+                                    conversation_module,
+                                    "async_get_chat_log",
+                                    None if legacy else conversation_module.async_get_chat_log,
+                                ),
+                                mock.patch.object(
+                                    agent.hass.services, "async_call", new_callable=mock.AsyncMock
+                                ) as speak,
+                            ):
+                                result = await agent.async_process(
+                                    FakeConversationInput(
+                                        "hello", conversation_id="nested-link", device_id="test-device"
+                                    )
+                                )
+                            self.assertEqual(result.response.speech["plain"]["speech"], expected)
+                            self.assertEqual(agent._history["nested-link"][-1]["content"], expected)
+                            speak.assert_awaited_once()
+                            assert speak.await_args is not None
+                            self.assertEqual(speak.await_args.args[2]["message"], expected)
+                            if not legacy:
+                                deltas = agent.hass.data["last_chat_log"].deltas
+                                self.assertEqual(
+                                    "".join(d.get("content", "") for d in deltas), expected
+                                )
 
     async def test_partial_stream_error_preserves_pending_plain_symbol(self):
         for suffix in ("22", "©", "#"):

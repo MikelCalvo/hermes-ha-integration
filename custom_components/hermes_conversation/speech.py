@@ -47,61 +47,152 @@ class SpeechMarkdownFilter:
     """Keep split inline links/images out of speech without buffering a turn.
 
     Retain only a possible label (up to 4096 characters); once a URL starts,
-    discard it incrementally. Ordinary text is emitted immediately.
+    discard it incrementally. Overlong bracketed text is dropped rather than
+    exposing a possible destination. Ordinary text is emitted immediately.
     """
 
     def __init__(self) -> None:
         self._label = ""
+        self._label_depth = 0
+        self._label_escaped = False
+        self._overlong_label = False
         self._url_depth = 0
+        self._url_escaped = False
+        self._url_label_prefix = ""
+
+    @staticmethod
+    def _last_label_start(label: str) -> int:
+        """Find the opening bracket paired with the trailing close bracket."""
+        stack: list[int] = []
+        escaped = False
+        for index, char in enumerate(label):
+            if escaped:
+                escaped = False
+                continue
+            if char == "\\":
+                escaped = True
+            elif char == "[":
+                stack.append(index)
+            elif char == "]":
+                if index == len(label) - 1:
+                    return stack[-1] if stack else 0
+                if stack:
+                    stack.pop()
+        # Even an escaped trailing ] may introduce a destination. Fail closed.
+        return stack[-1] if stack else 0
 
     def feed(self, text: str) -> str:
         """Emit visible text and link labels, never inline URL destinations."""
         parts: list[str] = []
         for char in text:
+            if self._overlong_label:
+                if self._label_escaped:
+                    self._label_escaped = False
+                elif char == "\\":
+                    self._label_escaped = True
+                elif char == "[":
+                    self._label_depth += 1
+                elif char == "]":
+                    self._label_depth -= 1
+                    if self._label_depth == 0:
+                        self._overlong_label = False
+                        self._label = "]"  # Suppress a following destination.
+                continue
             if self._url_depth:
-                if char == "(":
+                if self._url_escaped:
+                    self._url_escaped = False
+                elif char == "\\":
+                    self._url_escaped = True
+                elif char == "(":
                     self._url_depth += 1
                 elif char == ")":
                     self._url_depth -= 1
+                    if self._url_depth == 0:
+                        self._label = self._url_label_prefix
+                        self._url_label_prefix = ""
+                        self._label_depth = self._label.count("[") - self._label.count("]")
                 continue
 
-            if self._label == "!" and char != "[":
-                parts.append(self._label)
-                self._label = ""
-            elif self._label.endswith("]"):
+            if self._label.endswith("]"):
                 if char == "(":
-                    start = 2 if self._label.startswith("![") else 1
-                    parts.append(self._label[start:-1])
+                    start = self._last_label_start(self._label)
+                    prefix = self._label[:start]
+                    if prefix.endswith("!"):
+                        prefix = prefix[:-1]
+                    # Run labels through the same filter, so an image/link
+                    # inside a label cannot leak its own destination.
+                    nested = SpeechMarkdownFilter()
+                    label = nested.feed(self._label[start + 1:-1]) + nested.flush()
+                    if not prefix:
+                        parts.append(label)
+                    elif "[" not in prefix:
+                        parts.append(prefix + label)
+                        prefix = ""
+                    self._url_label_prefix = prefix + (label if prefix else "")
                     self._label = ""
                     self._url_depth = 1
                     continue
-                parts.append(self._label)
-                self._label = ""
-
-            if self._label or char in "[!":
-                self._label += char
-                # A long bracketed expression need not delay an entire reply.
-                if len(self._label) >= 4096:
+                if self._label_depth == 0:
+                    if char == "]":
+                        self._label += char
+                        continue
                     parts.append(self._label)
                     self._label = ""
-            else:
-                parts.append(char)
+
+            if self._label == "!" and char != "[":
+                parts.append("!")
+                self._label = ""
+
+            if not self._label:
+                if char in "[!":
+                    self._label = char
+                    self._label_depth = int(char == "[")
+                    self._label_escaped = False
+                elif char == "]":
+                    # A stray close bracket can still prefix a destination.
+                    self._label = char
+                    self._label_depth = 0
+                else:
+                    parts.append(char)
+                continue
+
+            self._label += char
+            if self._label == "![":
+                self._label_depth = 1
+            elif self._label_escaped:
+                self._label_escaped = False
+            elif char == "\\":
+                self._label_escaped = True
+            elif char == "[":
+                self._label_depth += 1
+            elif char == "]" and self._label_depth:
+                self._label_depth -= 1
+            if len(self._label) >= 4096:
+                # Conservatively discard the rest of an overlong bracketed
+                # expression; emitting it could expose a future destination.
+                self._label = ""
+                self._overlong_label = True
         return "".join(parts)
 
     def flush(self) -> str:
         """Release a non-link label, discarding any unfinished URL."""
         pending = self._label
         self._label = ""
+        self._label_depth = 0
+        self._label_escaped = False
+        self._overlong_label = False
         self._url_depth = 0
+        self._url_escaped = False
+        self._url_label_prefix = ""
         return pending
 
 
 class SpeechEmojiFilter:
     """Remove emoji without leaking components split across stream deltas.
 
-    Only an ambiguous text symbol or keycap prefix is held back (at most two
-    code points). Joiners and selectors are discarded after removed emoji, not
-    globally: a ZWJ can be meaningful in ordinary non-Latin text.
+    Only an ambiguous text symbol, keycap prefix or possible text-presentation
+    emoji is held back. Joiners and selectors are discarded after removed emoji,
+    not globally: a ZWJ can be meaningful in ordinary non-Latin text.
     """
 
     def __init__(self) -> None:
@@ -131,6 +222,13 @@ class SpeechEmojiFilter:
             self._after_emoji = False
 
             if _EMOJI_RE.fullmatch(char):
+                if i + 1 == len(text) and not final:
+                    self._pending = char
+                    break
+                if i + 1 < len(text) and text[i + 1] == "\ufe0e":
+                    parts.append(char + "\ufe0e")
+                    i += 2
+                    continue
                 self._after_emoji = True
                 i += 1
                 continue

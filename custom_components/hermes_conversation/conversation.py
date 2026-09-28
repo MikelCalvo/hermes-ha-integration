@@ -239,8 +239,8 @@ def _sanitize_stream_text_for_speech(text: str) -> str:
         return text
     cleaned = text.replace("\r\n", "\n")
     cleaned = _remove_unsafe_speech_markup(cleaned)
-    cleaned = re.sub(r"!\[([^\]]*)\]\([^\)]+\)", r"\1", cleaned)
-    cleaned = re.sub(r"\[([^\]]*)\]\([^\)]+\)", r"\1", cleaned)
+    markdown_filter = SpeechMarkdownFilter()
+    cleaned = markdown_filter.feed(cleaned) + markdown_filter.flush()
     return (
         cleaned.replace("```", "")
         .replace("`", "")
@@ -260,8 +260,8 @@ def _sanitize_text_for_speech(text: str) -> str:
     cleaned = strip_speech_emoji(cleaned)
     cleaned = re.sub(r"```(?:[\w+-]+)?\n?(.*?)```", r"\1", cleaned, flags=re.DOTALL)
     cleaned = re.sub(r"`([^`]+)`", r"\1", cleaned)
-    cleaned = re.sub(r"!\[([^\]]*)\]\([^\)]+\)", r"\1", cleaned)
-    cleaned = re.sub(r"\[([^\]]*)\]\([^\)]+\)", r"\1", cleaned)
+    markdown_filter = SpeechMarkdownFilter()
+    cleaned = markdown_filter.feed(cleaned) + markdown_filter.flush()
     cleaned = re.sub(r"^#{1,6}\s*", "", cleaned, flags=re.MULTILINE)
     cleaned = re.sub(r"^>+\s*", "", cleaned, flags=re.MULTILINE)
     cleaned = re.sub(r"^\s*[-*+]\s+", "", cleaned, flags=re.MULTILINE)
